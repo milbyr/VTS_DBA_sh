@@ -1,0 +1,1007 @@
+#!/bin/ksh
+#
+# xiv-clone
+#
+#  Clone an EBS environment to produce a new set of filesystems for
+#  a new EBS environment
+#
+# Version  Who          When           Why/How/What
+# 1.0      ARB          2015-05-14     Initial development begins
+#
+
+VTSDIR=/export/vtssupp/VTS
+BINDIR=${VTSDIR}/bin
+ETCDIR=${VTSDIR}/etc
+LOGDIR=${VTSDIR}/logs
+
+APPSORATAB=${ETCDIR}/appsoratab
+HOSTFNTAB=${ETCDIR}/hostfntab
+NFSTAB=${ETCDIR}/nfstab
+#NFSMOUNT=${BINDIR}/vit_nfs_mount.ksh
+#NFSUMOUNT=${BINDIR}/vit_nfs_umount.ksh
+#SMBCREATE=${BINDIR}/vit_smb.ksh
+#EBSDB=${BINDIR}/vit_ebs_db.ksh
+#EBSAPPS=${BINDIR}/vit_ebs_apps.ksh
+#CPRESTART=${BINDIR}/vit_start_cp_tier
+
+#ZONEPATH=/zones
+#NFSOPTS="rw,bg,hard,intr,vers=3,proto=tcp,sec=sys"
+MAXTRY=12
+TYPE="clone new environment"
+REFRESH=""
+#NDMP=""
+CREATECLONE="yes"
+RAPIDCLONE="yes"
+PRESENT="yes"
+EBSCLONE="yes"
+DATABASE=""
+
+chowndir=""
+
+cmd=$(basename $0)
+
+usage()
+{
+	print -R "Usage: ${cmd} [args] source-env new-env" >&2
+#	print -R "    Args: -s snapshot (snapshot to clone - default: 1)" >&2
+#	print -R "          -r          (refresh)" >&2
+#	print -R "          -c          (clone from existing copy)" >&2
+#	print -R "          -d          (clone data only - no RapidClone)" >&2
+#	print -R "          -u          (unmounted - no host presentation)" >&2
+#	print -R "          -p          (clone project - no EBS/RapidClone)" >&2
+	exit 1
+}
+
+conflict()
+{
+	print -R "Options \"$1\" and \"$2\" are mutually exclusive" >&2
+	usage
+}
+
+itime() {
+	#truss date 2>&1 | awk '$1 == "time()" {print $NF}'
+	date '+%s'
+}
+
+inverse()
+{
+	print -n -R "${1:+no}"
+	[[ -z "$1" ]] && print -n -R "yes"
+}
+
+cleanup()
+{
+	if [[ -n "$chowndir" && -d "$chowndir" ]]; then
+		print ""
+		TMLIST=$(mount | sed -n -e '\;^'"$chowndir"'/; s/ .*//p')
+		for tm in ${TMLIST}; do
+			print -R "Unmounting ${tm}"
+			umount "$tm"
+		done
+		for tm in $(ls "$chowndir"); do
+			rmdir "${chowndir}/${tm}"
+		done
+		rmdir "$chowndir"
+	fi
+
+	END_DATE=$(date '+%Y-%m-%d')
+	END_TIME=$(date '+%H:%M:%S')
+
+	print -R "*** finished at ${END_DATE} ${END_TIME}"
+
+	days=""
+	END_SECS=$(itime)
+	ELAPSED=$(("$END_SECS" - "$START_SECS"))
+
+	if [[ "$ELAPSED" -ge 86400 ]]; then
+		s=""
+		days="$(("$ELAPSED" / 86400))"
+		[[ "$days" -ne 1 ]] && s="s"
+		days="${days} day${s} "
+		ELAPSED=$(("$ELAPSED" % 86400))
+	fi
+
+	hours=$(("$ELAPSED" / 3600))
+	[[ "$hours" -eq 0 ]] && hours=""
+	mins=$(("$ELAPSED" % 3600))
+	secs=$(("$mins" % 60))
+	mins=$(("$mins" / 60))
+	[[ -n "hours" && "$mins" -lt 10 ]] && mins="0${mins}"
+	[[ "$secs" -lt 10 ]] && secs="0${secs}"
+
+	print -R "*** elapsed time: ${days}${hours:+${hours}:}${mins}:${secs}"
+}
+
+sumpr()
+{
+	nm="$1"
+	shift
+	printf "*** %20s: %s\n" "$nm" "$*"
+}
+
+summary()
+{
+	print -R ""
+	sumpr "Clone type" "$TYPE"
+	sumpr "Run RapidClone" "${RAPIDCLONE:-no}"
+	sumpr "Clone environment" "$ENVIRONMENT"
+	sumpr "Clone database" "$DATABASE"
+	sumpr "Storage pool" "$POOL"
+	sumpr "Source environment" "$SRCENV"
+	sumpr "Source database" "$SRCDB"
+	sumpr "Source snapshot" "$SNAPSHOT"
+
+	[[ "$POOL" != "$OLDPOOL" ]] && sumpr "Old storage pool" "$OLDPOOL"
+
+	sumpr "Present to hosts" "${PRESENT:-no}"
+	sumpr "CP hosts" "$CPHOSTS"
+	sumpr "Web/forms hosts" "$WFHOSTS"
+	sumpr "SMB hosts" "$smbhosts"
+	sumpr "Port pool" "$PORT"
+	sumpr "Oracle owner" "${ORAUSER} (${OUID})"
+	sumpr "Apps owner" "${APPLUSER} (${AUID})"
+	print -R ""
+}
+
+logwriter()
+{
+	exec >&3 2>&1
+	LOG=$(date '+%Y-%m-%d-%H:%M')-$1
+	LOGFILE=${LOGDIR}/${LOG}.log
+
+	print -R "*** ${cmd} $* ($0)" > ${LOGFILE}
+	print -R "*** started: ${START_DATE} ${START_TIME} on ${HOSTNAME}" \
+								>> ${LOGFILE}
+	print -R "*** user: $(whoami)" >> ${LOGFILE}
+	summary >> ${LOGFILE}
+
+	if [[ -n "$QUIET" ]]; then
+		cat > ${LOGFILE}
+	else
+		tee -a ${LOGFILE}
+	fi
+
+	END_DATE=$(date '+%Y-%m-%d')
+	END_TIME=$(date '+%H:%M:%S')
+
+	print -R "" >> ${LOGFILE}
+	print -R "*** finished at ${END_DATE} ${END_TIME}" >> ${LOGFILE}
+
+	days=""
+	END_SECS=$(date '+%s')
+	ELAPSED=$(("$END_SECS" - "$START_SECS"))
+
+	if [[ "$ELAPSED" -ge 86400 ]]; then
+		s=""
+		days="$(("$ELAPSED" / 86400))"
+		[[ "$days" -ne 1 ]] && s="s"
+		days="${days} day${s} "
+		ELAPSED=$(("$ELAPSED" % 86400))
+	fi
+
+	hours=$(("$ELAPSED" / 3600))
+	[[ "$hours" -eq 0 ]] && hours=""
+	mins=$(("$ELAPSED" % 3600))
+	secs=$(("$mins" % 60))
+	mins=$(("$mins" / 60))
+	[[ -n "hours" && "$mins" -lt 10 ]] && mins="0${mins}"
+	[[ "$secs" -lt 10 ]] && secs="0${secs}"
+
+	print -R "*** elapsed time:" \
+		"${days}${hours:+${hours}:}${mins}:${secs}" \
+		>> ${LOGFILE}
+}
+
+log()
+{
+	exec 3>&1
+	logwriter "$@" |&
+	exec >&p 2>&1
+}
+
+appsoratab()
+{
+	awk < "$APPSORATAB" -F: '$1 == "'"$1"'" \
+			{print $2, $3, $4, $5, $7, $12, $14} \
+		'
+}
+
+hostfntab()
+{
+	awk < ${HOSTFNTAB} -F: '$1 == "'"$1"'" {print $2}'
+}
+
+nfsclients()
+{
+	awk < "$NFSTAB" -F: '
+		BEGIN {
+			inservices = 1;
+		}
+		$1 ~ /#.*/ {
+			next;
+		}
+		$0 ~ /^\[.*\]$/ {
+			inservices = 0;
+			if($0 == servicetag)
+				inlist = 1;
+			else
+				inlist = 0;
+			next;
+		}
+		{
+			if(inservices) {
+				if(NF == 2 && $1 == "'"$1"'")
+					servicetag = "[" $2 "]";
+			} else if(inlist) {
+				if($1 != "") print $1;
+			}
+		}
+	'
+}
+
+nfslistformat()
+{
+	iplist=""
+	while read ipaddr; do
+		iplist="${iplist:+${iplist}:}@${ipaddr}/32"
+	done
+	print -R "sec=sys,rw=${iplist},root=${iplist}"
+}
+
+nfslist()
+{
+	nfsclients "$1" | nfslistformat
+}
+
+s7420()
+{
+	#
+	# s7420 takes one argument, the pool name, optionally followed
+	# by command line arguments for the filer's aksh (Appliance Kit
+	# shell). If there are no arguments following the pool name,
+	# they are supplied as standard input, allowing multiple line
+	# commands to be processed in a single s7420 call.
+	#
+	if [[ $# -lt 1 ]]; then
+		print -R "s7420: pool name not supplied" >&2
+		return 1
+	fi
+
+	poolname="$1"
+	shift
+
+	#
+	# The aksh command (input) is either the remaining arguments or the
+	# contents of standard input.
+	#
+	if [[ $# -gt 0 ]]; then
+		input="$*"
+	else
+		input=$(cat)
+	fi
+
+	#
+	# The aksh call then becomes one command to select the correct pool
+	# and then the command(s) supplied to s7420. The output from the
+	# SSH is captured for post-processing (it could be done in a single
+	# pipeline, but this syntax is easier).
+	#
+	output=$(ssh "ebssupp@${FILER}" -T <<- EOF
+		shares set pool=${poolname}
+		${input}
+	EOF
+	)
+
+	#
+	# Remove the "pool = poolname" line from the output. The remainder
+	# is passed back to the caller. This is effectively the output from
+	# the supplied command and nothing else.
+	#
+	print -R "$output" | awk '
+		{
+			if($1 == "pool" && $2 == "=") next;
+			print;
+		}
+	'
+}
+
+fslist()
+{
+	print -R "$1" | awk '
+			/^Filesystems:/ { infs=1; next; }
+			/^NAME[	 ]/ { if(infs) slist=1; next; }
+			/^$/ { if(slist) exit; next; }
+			{ if(slist) printf "%s:%s\n", $1, $3; }
+		'
+}
+
+lunlist()
+{
+	print -R "$1" | awk '
+			/^LUNs:/ { infs=1; next; }
+			/^NAME[	 ]/ { if(infs) slist=1; next; }
+			/^$/ { if(slist) exit; next; }
+			{ if(slist) print $1; }
+		'
+}
+
+luninfo()
+{
+	s7420 "$1" shares select "$2" select "$3" get lunguid | awk '
+			$1 == "lunguid" { lunguid = $3; next; }
+			END { print lunguid; }
+		'
+}
+
+projexists()
+{
+	for p in $(s7420 "$1" shares list); do
+		[[ "$p" = "$2" ]] && return 0
+	done
+	return 1
+}
+
+snapexists()
+{
+	for s in $(s7420 "$1" shares select "$2" snapshots list); do
+		[[ "$s" = "$3" ]] && return 0
+	done
+	return 1
+}
+
+clonesnaplist()
+{
+	s7420 "$1" <<- EOF 2>&1
+	script
+		function findclones(share, snap)
+		{
+			for(p = 0; p < projects.length; ++p) {
+				proj = projects[p];
+				try {
+					run('select ' + proj
+						+ ' select ' + share);
+					origin = get('origin');
+					if(origin.snapshot == snap &&
+							origin.project == "$2")
+						printf("%s:%s\n", proj, snap);
+				} catch(err) {
+					if(err.code == EAKSH_ENTITY_BADSELECT)
+						continue;
+					throw(err);
+				}
+				run('done');
+			}
+		}
+
+		run('shares');
+		projects = list();
+
+		run('select $2');
+		shares = list();
+		run('done');
+
+		for(sh = 0; sh < shares.length; ++sh) {
+			run('select $2 select ' + shares[sh] + ' snapshots');
+			snapshots = list();
+			run('done');
+
+			for(sn = 0; sn < snapshots.length; ++sn) {
+				run('select $2 select ' + shares[sh]
+					+ ' snapshots select ' + snapshots[sn]);
+
+				nclones = get('numclones');
+				run('done');
+
+				if(nclones > 0)
+					findclones(shares[sh], snapshots[sn]);
+			}
+		}
+	EOF
+}
+
+clonecheck()
+{
+
+	cclist=""
+	for projsnap in $(clonesnaplist "$1" "$2"); do
+		found=""
+		for c in ${cclist}; do
+			if [[ "$c" = "$projsnap" ]]; then
+				found=yes
+				break
+			fi
+
+		done
+		[[ -z "$found" ]] && cclist="${cclist} ${projsnap}"
+	done
+
+	print -R "$cclist"
+	return 0
+}
+
+project()
+{
+	#
+	# create a new project
+	# project "$POOL" "$NEWPROJ" "$AUID" "$ENVIRONMENT"
+	#
+	# First the list of servers allowed to access this project's NFS shares
+	#
+	sharenfs=""
+	[[ -n "$PRESENT" ]] && sharenfs=$(nfslist "$4")
+	[[ -z "$sharenfs" ]] && sharenfs="off"
+
+	#
+	# If the output does not match a set of expected messages,
+	# the entire output is sent to stderr
+	#
+	output=$(s7420 "$1" <<- EOF
+		shares project $2
+		set mountpoint=/export/$2
+		set default_user=$3
+		set default_group=600
+		set default_permissions=755
+		set sharenfs="${sharenfs}"
+		commit
+	EOF
+	)
+
+	print -R "$output" | awk '
+		{
+			if($1 == "mountpoint" && $2 == "=") next;
+			if($1 == "default_group" && $2 == "=") next;
+			if($1 == "default_permissions" && $2 == "=") next;
+			if($1 == "default_user" && $2 == "=") next;
+			if($1 == "default_permissions" && $2 == "=") next;
+			if($1 == "sharenfs" && $2 == "=") next;
+			exit 1;
+		}
+	'
+	[[ $? -ne 0 ]] && print -R "$output" >&2
+}
+
+fsclone()
+{
+	#
+	# clone an NFS share to a different project
+	# fsclone "$POOL" "$share" "$SRCPROJ" "$PROJECT"
+	#
+	# If the output does not match a set of expected messages,
+	# the entire output is sent to stderr
+	#
+	output=""
+	try=0
+	sleep=0
+	while [[ "$try" -lt "$MAXTRY" ]]; do
+		if [[ "$try" -gt 0 ]]; then
+			print -n -R "."
+
+			sleep=$(("$sleep" + 10))
+			sleep ${sleep}
+		fi
+
+		output=$(s7420 "$1" <<- EOF
+			shares select $3 select $2 snapshots select ${SNAPSHOT} clone $4 $2
+			unset mountpoint
+			unset reservation
+			commit
+		EOF
+		)
+
+		[[ "$output" != *"aksh: The action could not be completed because there is insufficient space available."* ]] && break
+
+		try=$(("$try" + 1))
+	done
+
+	if [[ -n "$output" ]]; then
+		print -R "$output" | awk '
+			{
+			  if($1 == "mountpoint" && $2 == "=") next;
+			  if($1 == "reservation" && $2 == "=") next;
+			  if($2 == "property" && $5 == "already") next;
+			  if($0 ~ /Waiting for the appliance shell/) next;
+			  exit 1;
+			}
+		'
+		[[ $? -ne 0 ]] && print -R "$output" >&2
+	fi
+}
+
+lunclone()
+{
+	#
+	# clone a LUN to a different project
+	# lunclone "$POOL" "$share" "$SRCPROJ" "$PROJECT"
+	#
+	# If there is any output from the s7420, the entire output is
+	# sent to stderr (LUN cloning should be silent if successful)
+	#
+	# First, the status (online/offline)
+	#
+	lunstatus="online"
+	[[ -z "$PRESENT" ]] && lunstatus="offline"
+	INITIATORGROUP=$(uname -n)
+
+	output=""
+	try=0
+	sleep=0
+	while [[ "$try" -lt "$MAXTRY" ]]; do
+		if [[ "$try" -gt 0 ]]; then
+			print -n -R "."
+
+			sleep=$(("$sleep" + 10))
+			sleep ${sleep}
+		fi
+
+		output=$(s7420 "$1" <<- EOF
+		  shares select $3 select $2 snapshots select ${SNAPSHOT} clone $4 $2
+		  set initiatorgroup=${INITIATORGROUP}
+		  set status=${lunstatus}
+		  set sparse=true
+		  commit
+		EOF
+		)
+
+		[[ "$output" != *"aksh: The action could not be completed because there is insufficient space available."* ]] && break
+
+		try=$(("$try" + 1))
+	done
+
+	if [[ -n "$output" ]]; then
+		print -R "$output" | awk '
+			{
+			  if($1 == "initiatorgroup" && $2 == "=") next;
+			  if($1 == "status" && $2 == "=") next;
+			  if($1 == "sparse" && $2 == "=") next;
+			  if($0 ~ /Waiting for the appliance shell/) next;
+			  exit 1;
+			}
+		'
+		[[ $? -ne 0 ]] && print -R "$output" >&2
+	fi
+}
+
+#
+# Parse arguments
+#
+POSITIONAL="SRCENV ENVIRONMENT"
+
+while [[ $# -gt 0 ]]; do
+	ARGNAME=""
+	if [[ "$1" = -* ]]; then
+		case "$1" in
+#		-n)
+#			TYPE="NDMP copy"
+#			NDMP=yes;;
+		-s)
+			ARGNAME="SNAPSHOT"
+			shift;;
+		-r)
+			TYPE="refresh existing environment"
+			REFRESH=yes;;
+		-c)
+			TYPE="clone existing copy"
+			CREATECLONE="";;
+		-d)
+			RAPIDCLONE="";;
+		-u)
+			PRESENT="";;
+		-p)
+			EBSCLONE="";;
+		*)
+			usage;;
+		esac
+	else
+		[[ -z "$POSITIONAL" ]] && usage
+		ARGNAME=${POSITIONAL%% *}
+		POSITIONAL=${POSITIONAL#* }
+		[[ "$POSITIONAL" = "$ARGNAME" ]] && POSITIONAL=""
+	fi
+
+	if [[ -n "$ARGNAME" ]]; then
+		[[ $# -eq 0 ]] && usage
+		eval ${ARGNAME}=\""$1"\"
+	fi
+	shift
+done
+
+[[ -n "$POSITIONAL" ]] && usage
+[[ -z "$CREATECLONE" && -n "$REFRESH" ]] && conflict -c -r
+[[ -z "$CREATECLONE" && -n "$SNAPSHOT" ]] && conflict -c -s
+[[ -n "$NDMP" && -z "$CREATECLONE" ]] && conflict -n -c
+[[ -n "$NDMP" && -n "$SNAPSHOT" ]] && conflict -n -s
+[[ -z "$EBSCLONE" && -n "$REFRESH" ]] && conflict -p -r
+[[ -z "$EBSCLONE" ]] && PRESENT=""
+[[ -z "$PRESENT" ]] && RAPIDCLONE=""
+
+[[ -z "$SNAPSHOT" ]] && SNAPSHOT="$(date '+%Y-%m-%d')"
+
+DATABASE=$(print -R "$ENVIRONMENT" | tr '[a-z]' '[A-Z]')
+SRCDB=$(print -R "$SRCENV" | tr '[a-z]' '[A-Z]')
+SRCPROJ="ebs${SRCENV}"
+PROJECT="${EBSCLONE:+ebs}${ENVIRONMENT}"
+HOSTNAME=$(uname -n)
+
+info=$(appsoratab ${SRCDB})
+if [[ -z "$info" ]]; then
+	print -R "${SRCENV}: invalid EBS environment" >&2
+	exit 2
+fi
+
+set -- ${info}
+FILER="$6"
+POOL="$7"
+
+info=$(appsoratab ${DATABASE})
+if [[ -z "$info" ]]; then
+	print -R "${ENVIRONMENT}: invalid EBS environment" >&2
+	exit 2
+fi
+
+set -- ${info}
+PORT="$1"
+ZONE="$2"
+MPLIST="$3"
+CPHOSTS="$4"
+WFHOSTS="$5"
+OLDPOOL="$7"
+
+ORAUSER="ora${ENVIRONMENT}"
+APPLUSER="appl${ENVIRONMENT}"
+OUID=$(($PORT + 500))
+AUID=$(($PORT + 600))
+
+START_DATE=$(date '+%Y-%m-%d')
+START_TIME=$(date '+%H:%M:%S')
+START_SECS=$(date '+%s')
+
+trap cleanup 0
+summary
+#log "clone-${ENVIRONMENT}"
+
+smbhosts="$(hostfntab samba)"
+allcphosts="$(hostfntab CP)"
+allwfhosts="$(hostfntab web)"
+
+ZONEROOT=${ZONEPATH}/${ZONE}/root
+nfshosts="${ZONE},${CPHOSTS},${WFHOSTS}"
+
+#
+# Merge the list of smbhosts into the list of NFS hosts
+# The Samba server needs the NFS shares, but the Samba server
+# may or may not be the CP server for this environment.
+#
+smbremain="$smbhosts"
+while [[ -n "$smbremain" ]]; do
+	smbh=${smbremain%%,*}
+	smbremain=${smbremain#*,}
+	[[ "$smbremain" = "$smbh" ]] && smbremain=""
+
+	nfsremain="$nfshosts"
+	found=""
+	while [[ -n "$nfsremain" ]]; do
+		host=${nfsremain%%,*}
+		nfsremain=${nfsremain#*,}
+		[[ "$nfsremain" = "$host" ]] && nfsremain=""
+
+		if [[ "$host" = "$smbh" ]]; then
+			found=yes
+			break
+		fi
+	done
+
+	[[ -z "$found" ]] && nfshosts="${nfshosts},${smbh}"
+done
+
+print -n -R "Checking instance ${DATABASE} is not in service ..."
+pmon=$(ps -e -o args | awk '{print $1}' | grep "ora_pmon_${DATABASE}")
+if [[ -n "$pmon" ]]; then
+	print -R ""
+	print -R "Environment ${ENVIRONMENT} is up: ${pmon} is running" >&2
+	exit 3
+fi
+print -R " OK"
+exit 0
+
+if projexists "$POOL" "$SRCPROJ"; then
+	if ! snapexists "$POOL" "$SRCPROJ" "$SNAPSHOT"; then
+		print -R "${cmd}: Snapshot ${SRCPROJ}@${SNAPSHOT}" \
+							"does not exist" >&2
+		exit 2
+	fi
+else
+	print -R "${cmd}: Project ${SRCPROJ} does not exist" >&2
+	exit 2
+fi
+
+if [[ -n "$REFRESH" ]]; then
+	#
+	# Umount everything and destroy the project
+	# First make sure we aren't about to destroy something with clones
+	# which are dependent on one of its snapshots, because that would
+	# destroy the dependent(s) too.
+	#
+	exists=""
+	projexists "$OLDPOOL" "$PROJECT" && exists=yes
+
+	if [[ -n "$exists" ]]; then
+		print -n -R "Checking snapshot dependencies ..."
+		clonelist=$(clonecheck "$OLDPOOL" "$PROJECT")
+		if [[ -n "$clonelist" ]]; then
+			print -R ""
+			print -R "${cmd}: Project ${PROJECT} has" \
+				"the following dependent clone(s):" >&2
+			print -R "    Project           Snapshot"
+			print -R "    =======           ========"
+			for cs in ${clonelist}; do
+				printf "    %-14s    %-s\n" \
+							"${cs%%:*}" "${cs#*:}"
+			done
+			exit 3
+		fi
+		print -R " OK"
+	fi
+
+	nfsremain="${ZONE},${allcphosts},${allwfhosts}"
+	while [[ -n "$nfsremain" ]]; do
+		host=${nfsremain%%,*}
+		nfsremain=${nfsremain#*,}
+		[[ "$nfsremain" = "$host" ]] && nfsremain=""
+
+		print ""
+		print -R "Unmounting NFS on ${host}"
+
+		ssh ${host} ${NFSUMOUNT} ${ENVIRONMENT}
+	done
+
+	print ""
+	print -R "Unmounting old ${PROJECT} LUNs on ${ZONE}:"
+	zmplist=$(mount | awk '
+		  $1 ~ /^\/zones\/'"$ZONE"'\/root\/ora'"$ENVIRONMENT"'\// {
+		  print $1;
+		}')
+
+	for mp in ${zmplist}; do
+		print -R "Unmounting ${mp}"
+		umount ${mp}
+	done
+
+	print ""
+	print -R "Removing old ${PROJECT} configuration from ${ZONE}:"
+	OFSLIST=$(zonecfg -z "$ZONE" info fs \
+			| awk '$1 == "dir:" && $2 ~ /^\/ora'"$ENVIRONMENT"'\// \
+			{print $2}')
+	if [[ -n "$OFSLIST" ]]; then
+		for dir in ${OFSLIST}; do
+			print -R "$dir"
+			zonecfg -z "$ZONE" "remove fs dir=${dir}"
+		done
+	else
+		print -R "none configured"
+	fi
+
+	if [[ -n "$exists" ]]; then
+		print ""
+		print -R "Destroying project "\""$PROJECT"\"
+		s7420 "$OLDPOOL" confirm shares destroy "$PROJECT"
+	fi
+
+elif projexists "$OLDPOOL" "$PROJECT"; then
+	print -R "${cmd}: Project ${PROJECT} already exists" >&2
+	exit 2
+fi
+
+print -R "Creating project "\""$PROJECT"\"" (UID ${OUID}/${AUID})"
+project "$POOL" "$PROJECT" "$AUID" "$ENVIRONMENT"
+
+sharelist=$(s7420 "$POOL" shares select "$SRCPROJ" list)
+fsmounts=$(fslist "$sharelist")
+fsshares=$(print -R "$fsmounts" | awk -F: '{print $1}')
+lunshares=$(lunlist "$sharelist")
+
+print -R "Cloning ${SRCPROJ} to ${PROJECT}"
+
+for share in ${fsshares}; do
+	print -n -R "NFS ${SRCPROJ}/${share}@${SNAPSHOT}" \
+						"to ${PROJECT}/${share} ..."
+	fsclone "$POOL" "$share" "$SRCPROJ" "$PROJECT"
+	print -R " (done)"
+done
+
+for share in ${lunshares}; do
+	print -n -R "LUN ${SRCPROJ}/${share}@${SNAPSHOT}" \
+						"to ${PROJECT}/${share} ..."
+	lunclone "$POOL" "$share" "$SRCPROJ" "$PROJECT"
+	print -R " (done)"
+done
+
+if [[ -n "$PRESENT" ]]; then
+	devfsadm -C
+	dsk=$(ls /dev/dsk)
+	mplist="$MPLIST"
+	zmplist=""
+
+	while [[ -n "$mplist" ]]; do
+		mp=${mplist%%,*}
+		mplist=${mplist#*,}
+		[[ "$mplist" = "$mp" ]] && mplist=""
+
+		share=${mp%%-*}
+		mpoint=${mp#*-}
+		if [[ -z "$share" || -z "$mpoint" ]]; then
+			print -R "syntax error in appsoratab: "\""$MPLIST"\" >&2
+			continue
+		fi
+
+		print ""
+		print -R "Mounting ${share}: ${mpoint}"
+		guid=$(luninfo "$POOL" "$PROJECT" "$share")
+		if [[ -z "$guid" ]]; then
+			print -R "GUID for ${PROJECT}/${share} not found" >&2
+			continue
+		fi
+
+		print -n -R "GUID: ${guid}"
+		try=0
+		sleep=0
+		while [[ "$try" -lt "$MAXTRY" ]]; do
+			if [[ "$try" -gt 0 ]]; then
+				print -n -R " (retrying)"
+				sleep=$(("$sleep" + 10))
+				sleep ${sleep}
+
+				devfsadm -C
+				dsk=$(ls /dev/dsk)
+			fi
+
+			dev=$(print -R "$dsk" \
+				| grep "^c[0-9][0-9]*t${guid}d[0-9][0-9]*s0$")
+			[[ -n "$dev" ]] && break
+
+			try=$(("$try" + 1))
+		done
+		print -R ""
+
+		if [[ -z "$dev" ]]; then
+			print -R "device "\""$guid"\"" not found" >&2
+			continue
+		fi
+
+		raw="/dev/rdsk/${dev}"
+		dev="/dev/dsk/${dev}"
+		print -R "Device: ${dev}"
+		print -n -R "mounting:"
+
+		print -n -R " zonecfg"
+		zonecfg -z "$ZONE" "add fs; \
+					set dir = ${mpoint}; \
+					set special = ${dev}; \
+					set raw = ${raw}; \
+					set type = ufs; \
+					end \
+				"
+
+		zmpoint="${ZONEROOT}${mpoint}"
+		print -n -R " ${zmpoint}"
+		mkdir -p ${zmpoint}
+		mount ${dev} ${zmpoint}
+		zmplist="${zmplist} ${zmpoint}"
+		print -R " (done)"
+	done
+
+	#
+	# Run the database chowns first. This is fairly quick.
+	#
+	print ""
+	for mp in ${zmplist}; do
+		print -R "Changing ownership of ${mp}"
+		chown -R -h ${OUID} ${mp} &
+	done
+
+	#
+	# Wait for the database chowns to finish.
+	#
+	print -n -R "Waiting for chown of database tier to complete ..."
+	wait
+	print -R " (done)"
+
+	#
+	# Now we can start up the chowns of the apps tiers (NFS), which will
+	# take much longer, but will not prevent the RapidClone of the DB.
+	#
+	print ""
+	sharelist=$(s7420 "$POOL" shares select "$PROJECT" list)
+	splist=$(fslist "$sharelist")
+	chowndir=$(mktemp -d /tmp/.vit_snap_refresh.$$.XXXXXX)
+
+	for sp in ${splist}; do
+		sname=${sp%%:*}
+		spath=${sp#*:}
+		[[ -z "$sname" || -z "$spath" ]] && continue
+
+		print -R "Changing ownership of ${FILER}:${spath} (${sname})"
+		mkdir ${chowndir}/${sname}
+		mount -o "$NFSOPTS" ${FILER}:${spath} ${chowndir}/${sname}
+		chown -R -h ${AUID} ${chowndir}/${sname} &
+	done
+
+	if [[ -z "$REFRESH" ]]; then
+		#
+		# Create smb.conf entries on the Samba host(s)
+		#
+		while [[ -n "$smbhosts" ]]; do
+			host=${smbhosts%%,*}
+			smbhosts=${smbhosts#*,}
+			[[ "$smbhosts" = "$host" ]] && smbhosts=""
+
+			ssh "$host" ${SMBCREATE} ${ENVIRONMENT}
+		done
+	fi
+fi
+
+#
+# RapidClone the database. This can be run while the apps tiers are
+# still chowning.
+#
+if [[ -n "$RAPIDCLONE" ]]; then
+	print ""
+	print -R "*** Starting dbTier clone as ${ORAUSER} on ${ZONE}"
+	chmod 755 ${EBSDB}
+	ssh "${ORAUSER}@${ZONE}" ${EBSDB} ${SRCDB} ${DATABASE}
+	chmod 700 ${EBSDB}
+fi
+
+if [[ -n "$PRESENT" ]]; then
+	#
+	# Once the DB clone has completed, we need to wait for the remaining
+	# chowns (the apps tiers) to finish before we can carry on with that
+	# part of the RapidClone process.
+	#
+	print -n -R "Waiting for chown of application tier to complete ..."
+	wait
+	print -R " (done)"
+
+	#
+	# Mount NFS shares on CP/Samba/Web/forms hosts
+	#
+	nfsremain="$nfshosts"
+	while [[ -n "$nfsremain" ]]; do
+		host=${nfsremain%%,*}
+		nfsremain=${nfsremain#*,}
+		[[ "$nfsremain" = "$host" ]] && nfsremain=""
+
+		print ""
+		print -R "Mounting NFS on ${host}"
+
+	#	ssh "$host" ${NFSMOUNT} ${ENVIRONMENT} ${SRCENV} ${fsmounts}
+		ssh "$host" ${NFSMOUNT} ${ENVIRONMENT}
+	done
+fi
+
+if [[ -n "$RAPIDCLONE" ]]; then
+	chmod 755 ${EBSAPPS}
+	apphosts="${CPHOSTS},${WFHOSTS}"
+	while [[ -n "$apphosts" ]]; do
+		host=${apphosts%%,*}
+		apphosts=${apphosts#*,}
+		[[ "$apphosts" = "$host" ]] && apphosts=""
+
+		print ""
+		print -R "*** Starting appsTier clone as ${APPLUSER} on ${host}"
+		ssh "${APPLUSER}@${host}" ${EBSAPPS} ${SRCDB} ${DATABASE}
+	done
+	chmod 700 ${EBSAPPS}
+
+	#
+	# Restart listener (one of the shared libraries may have been modified
+	# on an NFS share, which would cause ld to kill the process).
+	#
+	if [[ -n "$RAPIDCLONE" ]]; then
+		print -n -R "Restarting ${DATABASE} listener ..."
+		ssh "ebssupp@${ZONE}" ${CPRESTART} ${DATABASE}
+		print -R " (done)"
+	fi
+fi
+
+exit 0
+

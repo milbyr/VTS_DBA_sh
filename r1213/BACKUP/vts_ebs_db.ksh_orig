@@ -1,0 +1,637 @@
+#!/usr/bin/ksh
+#= = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =#
+# R. Milby      20141205                                                                          #
+#                                                                                                 #
+# To recover a hot backup and clone                                                               #
+#= = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =#
+# History                                                                                         #
+# converted to EMSS R12.2                                                                         #
+#                                                                                                 #
+#       When            Who     What                                                              #
+#       =====================================================================                     #
+#                                                                                                 #
+#= = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =#
+#
+export DBA=/export/vtssupp/VTS
+export L_VERBOSE=1
+export G_ENV=1
+
+if [ -f $DBA/bin/vts_utils.ksh ]; then
+.   $DBA/bin/vts_utils.ksh
+else
+  echo "$DBA/bin/vts_utils.ksh is missing"
+fi
+
+
+function FN_Inc
+{
+  export L_STEP=`expr $L_STEP \+ 1`
+}
+
+
+function FN_InitOra_old
+{
+  L_ORACLE_HOME=$(FN_ORACLE_HOME $L_ORACLESID )
+
+( cat <<EOF
+
+db_name = $L_ORACLESID
+control_files  = /ora${L_LCORACLESID}/data01/cntrl01.dbf,/ora${L_LCORACLESID}/data02/cntrl02.dbf,/ora${L_LCORACLESID}/fra/cntrl03.dbf
+db_files                        = 512         # Max. no. of database files
+undo_management=AUTO                   # Required 11i setting
+undo_tablespace=APPS_UNDOTS1     # Required 11i setting
+sga_target						= 5G
+processes						= 1200
+sessions						= 2400
+db_block_size                   = 8192
+compatible                      = 11.2.0
+diagnostic_dest                 = /ora${L_LCORACLESID}
+EOF
+) > $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora
+
+}   ### End of FN_InitOra_old ###
+
+
+function FN_InitOra
+{
+  L_ORACLE_HOME=$(FN_ORACLE_HOME $L_ORACLESID )
+
+  mv $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora.autoconfig
+  cat $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora.autoconfig | sed -e "s/utl_file_dir = \/usr\/tmp,/utl_file_dir = /" > $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora
+  echo "utl_file_dir = /appl${L_LCORACLESID}/csf/temp, /appl${L_LCORACLESID}/csf/log, /appl${L_LCORACLESID}/csf/out, /usr/tmp" >> $L_ORACLE_HOME/dbs/init${L_ORACLESID}.ora
+
+} ### End of FN_InitOra ###
+
+
+function FN_orapwd
+{
+  L_ORACLE_HOME=$(FN_ORACLE_HOME $L_ORACLESID )
+  export ORACLE_HOME=${L_ORACLE_HOME}
+
+  l_password=${1:?"FN_orapwd: Missing the system password"}
+  FN_Debug "$L_ORACLE_HOME/bin/orapwd password=$l_password entries=10 file=$L_ORACLE_HOME/dbs/orapw$L_ORACLESID"
+
+ $L_ORACLE_HOME/bin/orapwd password=$l_password entries=10 file=$L_ORACLE_HOME/dbs/orapw$L_ORACLESID
+  if [ $? -ne 0 ] ; then
+    FN_Error "FN_orapwd FAILED"
+  fi
+}
+
+
+function FN_Sym_Links
+{
+echo
+}
+
+function FN_ora_env
+{
+
+  L_ORACLE_HOME=$(FN_ORACLE_HOME $L_ORACLESID )
+  LC_S_SID=`echo "$L_S_SID" | tr "[:upper:]" "[:lower:]"`
+  LC_T_SID=`echo "$L_ORACLESID" | tr "[:upper:]" "[:lower:]"`
+
+  cat $L_ORACLE_HOME/${L_S_SID}_${L_DBSRV}.env | sed "s/${L_S_SID}/${L_ORACLESID}/g" | sed "s/ora${LC_S_SID}/ora${LC_T_SID}/g" > $L_ORACLE_HOME/${L_ORACLESID}_${L_DBSRV}.env
+
+}
+
+
+function FN_backup_dir
+{
+ if [ -d /ora${L_LCORACLESID}/diag/PRD3_${L_DBSRV}/backup_archive ]; then
+  l_dir=`ls -1dtr /ora${L_LCORACLESID}/diag/PRD3_${L_DBSRV}/backup_archive/backup_*|tail -1`
+  #FN_Debug "FN_backup_dir: l_dir is $l_dir"
+  echo "$l_dir"
+ else
+  echo "FN_backup_dir: /ora${L_LCORACLESID}/diag/${L_ORACLESID}_${L_DBSRV}/backup_archive does NOT exist"
+ fi
+}
+
+
+function FN_ALF
+{
+ export L_BKUP_DIR=$(FN_backup_dir)
+
+  for l_fn in `ls -1tr $L_BKUP_DIR/*arc.gz`
+  do
+    if [ -e ${l_fn} ]; then
+      l_fn2=${l_fn%%.gz}
+      gzip -cd <$l_fn >$l_fn2
+      echo "$l_fn2"
+    else
+     FN_Debug "FN_ALF: failed"
+    fi
+ done
+}
+
+function FN_Clone_dir
+{
+CLONE_DIR=$HOME/CLONE_$TARGET_SID
+
+if [ -d $CLONE_DIR ]; then
+   echo $CLONE_DIR
+else
+   mkdir -p $CLONE_DIR
+   echo $CLONE_DIR
+fi
+}
+
+function FN_CR_CTL_Script
+{
+echo
+echo "Generating Control file script."
+echo
+S_LN=`egrep -n "CREATE CONTROLFILE" $SOURCE_CONTROL_FILE | head -1 | awk -F: '{print $1}'`
+E_LN=`egrep -n "CHARACTER" $SOURCE_CONTROL_FILE | head -1 | awk -F: '{print $1}'`
+ROWS=`expr $E_LN \- $S_LN \+ 2`
+
+export LC_S_SID=`echo "$L_S_SID" | tr "[:upper:]" "[:lower:]"`
+export LC_T_SID=`echo "$L_T_SID" | tr "[:upper:]" "[:lower:]"`
+tail +$S_LN $SOURCE_CONTROL_FILE | head -n $ROWS | sed 's/REUSE/SET/' | sed 's/NORESETLOGS/RESETLOGS/' | sed 's/ARCHIVELOG/NOARCHIVELOG/' | sed "s/$L_S_SID/$L_T_SID/" | sed "s/$LC_S_SID/$LC_T_SID/" > $TARGET_ORAHOME/control.sql
+
+}
+
+
+function FN_CR_TMP_Script
+{
+  export L_BKUP_DIR=$(FN_backup_dir)
+ ( cat <<EOF
+
+ALTER TABLESPACE TEMP
+ADD TEMPFILE '/ora${L_LCORACLESID}/data03/temp01.dbf'
+SIZE 100M REUSE AUTOEXTEND ON NEXT 100m  MAXSIZE 4000M;
+
+EOF
+ ) >$L_BKUP_DIR/cr_tmp.sql 2>&1
+
+}
+
+
+function FN_ORACLE_ENV
+{
+   export ORACLE_HOME=$L_ORACLEHOME
+   
+# todo - check G_ENV to see if the env file has already been run #
+
+  if [ $G_ENV -eq 1 ]; then
+    if [ -f  $ORACLE_HOME/${L_DBCONTEXT_NAME}.env ]; then
+      . $ORACLE_HOME/${L_DBCONTEXT_NAME}.env
+      export G_ENV=0
+    else
+      FN_Error "FN_ORACLE_ENV: the environment file $ORACLE_HOME/${L_DBCONTEXT_NAME}.env DOES NOT EXIST"
+      export ORACLE_SID=${L_ORACLESID}
+      export LD_LIBRARY_PATH=${ORACLE_HOME}/lib,${ORACLE_HOME}/ctx/lib
+      export PATH=$ORACLE_HOME/bin:/usr/ccs/bin:/usr/bin
+      export TNS_ADMIN=$ORACLE_HOME/network/admin/${L_ORACLESID}_${L_DBSRV}
+    fi
+  else
+    FN_Debug "FN_ORACLE_ENV: G_ENV=$G_ENV :- ${L_DBCONTEXT_NAME}.env already run"
+  fi
+}
+
+
+function FN_DB_CTL
+{
+  FN_ORACLE_ENV
+
+case $1 in
+
+ start | START )
+    L_COMMAND="startup;"
+    ;;
+ stop | STOP )
+    L_COMMAND="shutdown immediate;"
+    ;;
+ abort | ABORT )
+    L_COMMAND="shutdown abort;"
+    ;;
+ force | FORCE )
+    L_COMMAND="startup force;"
+    ;;
+  *) echo "FN_DB_CTL: this is an error"
+    ;;
+esac
+
+    sqlplus  -s / as sysdba <<EOF
+      whenever sqlerror exit FAILURE;
+      ${L_COMMAND}
+EOF
+  export L_ERROR=$?
+}
+
+function FN_Check_cr
+{
+CONTROL_FILE1=`grep control_file $TARGET_ORAHOME/dbs/init$TARGET_SID.ora |cut -d'=' -f2 | cut -d',' -f1`
+CONTROL_FILE2=`grep control_file $TARGET_ORAHOME/dbs/init$TARGET_SID.ora |cut -d'=' -f2 | cut -d',' -f2`
+CONTROL_FILE3=`grep control_file $TARGET_ORAHOME/dbs/init$TARGET_SID.ora |cut -d'=' -f2 | cut -d',' -f3`
+
+if [ -f $CONTROL_FILE1 ];
+then
+   rm -rf $CONTROL_FILE1 
+else
+   echo
+fi
+
+if [ -f $CONTROL_FILE2 ];
+then
+   rm -rf $CONTROL_FILE2 
+else
+   echo
+fi
+
+if [ -f $CONTROL_FILE3 ];
+then
+   rm -rf $CONTROL_FILE3 
+else
+   echo
+fi
+}
+
+function FN_CR_CTL
+{
+echo
+echo "Recreating control file."
+echo
+echo
+
+echo "Logfile: " $CLONE_DIR/control.log
+echo
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/control.log << EOF
+create spfile from pfile;
+startup nomount;
+@$TARGET_ORAHOME/control.sql
+exit;
+EOF
+}
+
+
+function FN_Recover_DB
+{
+echo
+echo "Recover Database"
+echo
+echo
+
+echo "Logfile: " $CLONE_DIR/recover.log
+echo
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/recover.log << EOF
+alter system set log_archive_format='%t_%s_%r.arc' scope=spfile; 
+shutdown immediate;
+startup mount;
+recover database using backup controlfile until cancel;
+
+CANCEL
+exit;
+EOF
+}
+
+
+function FN_Open_DB
+{
+echo
+echo "Open Database."
+echo
+
+echo "Logfile : " $CLONE_DIR/open_db.log
+echo
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/open_db.log << EOF
+alter database open resetlogs;
+select name,open_mode from v\$database;
+exit;
+EOF
+}
+
+
+function FN_add_temp
+{
+echo
+echo "Adding Tempfiles."
+echo
+
+echo $TARGET_SID
+echo $TARGET_DBHOST
+echo $TARGET_ORAHOME
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/add_temp.log << EOF
+ALTER TABLESPACE TEMP1 ADD TEMPFILE '$TARGET_ORABASE/data03/temp01.dbf' SIZE 2000M REUSE AUTOEXTEND OFF;
+ALTER TABLESPACE TEMP2 ADD TEMPFILE '$TARGET_ORABASE/data03/temp02.dbf' SIZE 2000M REUSE AUTOEXTEND OFF;
+exit;
+EOF
+}
+
+
+function FN_genpairs 
+{
+echo
+echo "Generating Pairsfile."
+echo
+echo "s_dbhost=$TARGET_DBHOST
+s_dbCluster=false
+s_dbSid=$TARGET_SID
+s_db_oh=$TARGET_ORAHOME
+s_display=$TARGET_DBHOST:1.0
+s_port_pool=$DB_PORT_POOL
+s_base=$TARGET_ORABASE
+s_dbhome1=$TARGET_ORABASE/data01
+s_dbhome2=$TARGET_ORABASE/data02
+s_dbhome3=$TARGET_ORABASE/data03
+s_dbhome4=$TARGET_ORABASE/data01
+s_archive_dest=$TARGET_ARCH
+s_archive_format=%t_%s_%r.arc
+s_db_sga_target=$TARGET_SGA
+s_db_pga_aggregate_target=$TARGET_PGA
+s_db_shared_pool_size=$TARGET_SHARED_POOL
+s_db_processes=$TARGET_PROCESSES
+s_db_sessions=$TARGET_SESSIONS
+s_db_util_filedir=$TARGET_APPLBASE/csf/temp,$TARGET_APPLBASE/csf/out,$TARGET_APPLBASE/csf/log" > $CLONE_DIR/pairsfile.txt
+}
+
+
+
+
+function FN_adclonectx
+{
+echo
+echo "Ganerating Target DB Context File"
+echo
+echo
+echo "Logfile: " $CLONE_DIR/db_context.log
+echo
+echo
+
+echo $SOURCE_APPSPWD | perl /$TARGET_ORAHOME/appsutil/clone/bin/adclonectx.pl contextfile=/$TARGET_ORAHOME/appsutil/"$SOURCE_SID"_"$SOURCE_DBHOST".xml pairsfile=$CLONE_DIR/pairsfile.txt outfile=$TARGET_ORAHOME/appsutil/"$TARGET_SID"_"$TARGET_DBHOST".xml validate noprompt > $CLONE_DIR/db_context.log
+}
+
+
+
+function FN_dbTechStack
+{
+echo
+echo "Running DB Tech Stack"
+echo
+
+echo "Logfile: " $CLONE_DIR/db_tech_stack.log
+echo
+echo $SOURCE_APPSPWD | perl /$TARGET_ORAHOME/appsutil/clone/bin/adcfgclone.pl dbTechStack /$TARGET_ORAHOME/appsutil/"$TARGET_SID"_"$TARGET_DBHOST".xml > $CLONE_DIR/db_tech_stack.log
+ 
+}
+
+function FN_dbconfig
+{
+echo
+echo "Running DB Config."
+echo
+
+echo "Logfile: " $CLONE_DIR/dbconfig.log
+
+echo $SOURCE_APPSPWD | perl $TARGET_ORAHOME/appsutil/clone/bin/adcfgclone.pl dbconfig $TARGET_ORAHOME/appsutil/"$TARGET_SID"_"$TARGET_DBHOST".xml > $CLONE_DIR/dbconfig.log
+}
+
+
+function FN_clone_lib
+{
+echo
+echo "Update Library." 
+echo
+
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/updtlib.log << EOF
+@?/appsutil/install/$TARGET_SID\_$TARGET_DBHOST/adupdlib.sql so
+exit;
+EOF
+}
+
+
+function FN_setup_clean
+{
+echo
+echo "Running Setup Clean."
+echo
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s apps/$SOURCE_APPSPWD > $CLONE_DIR/fnd_setup_clean.log << EOF
+exec fnd_conc_clone.setup_clean;
+commit;
+exit;
+EOF
+}
+
+function FN_updt_utl
+{
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/utl_file.log << EOF
+alter system set utl_file_dir='$TARGET_APPLBASE/csf/temp','$TARGET_APPLBASE/csf/out','$TARGET_APPLBASE/csf/log','$TARGET_ORAHOME/appsutil/outbound/${TARGET_SID}_${TARGET_DBHOST}','/usr/tmp' scope=spfile;
+shutdown immediate;
+create pfile from spfile;
+startup;
+show parameter utl_file_dir
+exit;
+EOF
+}
+
+function FN_chng_passwd
+{
+echo
+echo "Changing Passwords."
+echo
+
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/change_passwd.log << EOF
+alter user system identified by $TARGET_SYSTEM_PASSWD;
+alter user sys identified by $TARGET_SYS_PASSWD;
+exit;
+EOF
+}
+
+function FN_DB_Dir
+{
+
+. $TARGET_ORAHOME/"$TARGET_SID"_"$TARGET_DBHOST".env
+sqlplus -s "/as sysdba" > $CLONE_DIR/db_directory.log << EOF
+create or replace directory TIMEZDIF_DIR as '$TARGET_ORABASE/11.2.0/oracore/zoneinfo';
+create or replace directory XXLBG_GFI_INT as '$TARGET_APPLBASE/csf/interface09/process';
+create or replace directory XXLBG_GFI_INT_BAD_FILES as '$TARGET_APPLBASE/csf/interface09/bad_files';
+create or replace directory XXLBG_GFI_INT_LOG as '$TARGET_APPLBASE/csf/interface09/log';
+create or replace directory XXLBG_GFI_ARC as '$TARGET_APPLBASE/csf/interface09/archive';
+create or replace directory XXLBG_GFI_INT_OUTB as '$TARGET_APPLBASE/csf/interface09/outbound';
+create or replace directory EXT_TAB_DATA_1 as '$TARGET_APPLBASE/csf/temp';
+exit;
+EOF
+}
+
+function FN_autocfg
+{
+echo
+echo "Running Autoconfig."
+echo
+
+echo "Logfile: " $CLONE_DIR/autoconfig.log
+
+$TARGET_ORAHOME/appsutil/scripts/"$TARGET_SID"_"$TARGET_DBHOST"/adautocfg.sh appspass=$SOURCE_APPSPWD > $CLONE_DIR/autoconfig.log
+
+}   ### end of FN_autocfg ###
+
+
+
+
+function FN_tns_ifile
+{
+  ##FN_ORACLE_ENV
+
+  echo "ifile=/export/ops/emss/GLOBAL/tnsnames_LCC.ora" > ${L_ORACLEHOME}/network/admin/${L_DBCONTEXT_NAME}/${L_DBCONTEXT_NAME}_ifile.ora
+}
+
+
+function FN_lsnr_ifile
+{
+echo
+}
+
+
+function sql_dir_txt
+{
+  ## called by FN_db_dirs ##
+
+  LC_S_SID=`echo "$L_S_SID" | tr "[:upper:]" "[:lower:]"`
+
+  sqlplus -s / as sysdba  <<SQLEND
+    set pages 200 lines 5000 trims on head off
+    set echo on feedback off
+
+    select 'create or replace directory '|| DIRECTORY_NAME || '  as ''' || replace(DIRECTORY_PATH,'${LC_S_SID}','${L_LCORACLESID}')||''';'
+    from dba_directories
+    where directory_path like '%${LC_S_SID}%';
+SQLEND
+
+} ### end of sql_dir_txt ###
+
+
+function FN_db_dirs
+{
+echo 
+}
+
+
+function FN_db_links
+{
+  #
+  ## OWNER    DB_LINK                                  USERNAME HOST
+  ## -------- ---------------------------------------- -------- --------------------
+  ## APPS     APPS_TO_APPS                             APPS     RIPRD34
+  ## APPS     APPS_TO_APPS.LEICS.GOV.UK                APPS     DEV4
+  ## APPS     APPS_TO_APPS.US.ORACLE.COM               APPS     EDV3_DDS.world
+  ## APPS     EDW_APPS_TO_WH                           APPS     RIPRD34
+  ## APPS     EDW_APPS_TO_WH.LEICS.GOV.UK              APPS     DEV4
+  ## APPS     EDW_APPS_TO_WH.US.ORACLE.COM             APPS     EDV3_DDS.world
+  ## APPS     FIS_PRD3_PRD2_DBLNK.LEICS.GOV.UK         APPS     EDV3_DDS.world
+  ## APPS     FIS_PRD3_TMP1_DBLNK.LEICS.GOV.UK         APPS     EDV3_DDS.world
+  ## BODATA   EBUS_LPMS_DBLNK.LEICS.GOV.UK             BODATA   lpms_dds
+  ## BODATA   EBUS_LPNT_DBLNK.LEICS.GOV.UK             GUEST    lpnt
+
+
+  export L_ERROR=$?
+
+}
+
+function FN_user_ops
+{
+echo 
+}   ### End of FN_user_ops ###
+
+
+function FN_user_reset_db_users
+{
+  sqlplus  -s / as sysdba <<SQLEOF
+
+  prompt alter user xxlbg identified by xxlbg_${L_ORACLESID};
+         alter user xxlbg identified by xxlbg_${L_ORACLESID};
+ 
+SQLEOF
+  export L_ERROR=$?
+}   ### End of FN_user_reset_db_users ###
+
+
+function FN_Conc_Reqs
+{
+  L_PASSWD=$(FN_GetAPPSPassword $L_S_SID)
+
+    sqlplus -s /nolog <<EOF
+      connect apps/${L_PASSWD}
+
+      whenever sqlerror exit FAILURE
+
+      prompt Removing the running concurrent requests...
+      delete from fnd_concurrent_requests
+      where phase_code = 'R'
+        or CONCURRENT_PROGRAM_ID = 38121;
+
+
+EOF
+  export L_ERROR=$?
+}
+
+
+
+function FN_Env
+{
+if [ -f $HOME/scripts/$L_T_SID.env ];
+then
+   . $HOME/scripts/$L_T_SID.env
+else
+   echo "Error: Environment file is missing."
+   exit;
+fi
+}
+
+
+
+function FN_Main
+{
+  FN_Init_Vars ${L_T_SID}
+  FN_List_Vars
+
+  echo "at step $L_STEP: FN_dbTechStack"
+  FN_Env 
+  FN_Clone_dir
+  FN_genpairs
+  FN_adclonectx
+  FN_dbTechStack
+  FN_CR_CTL_Script
+  FN_Check_cr
+  FN_CR_CTL
+  FN_Recover_DB
+  FN_Open_DB
+  FN_setup_clean
+  FN_add_temp
+  FN_clone_lib
+  FN_dbconfig
+  FN_updt_utl
+  FN_chng_passwd
+  FN_DB_Dir
+  #FN_autocfg    
+}
+
+# - - - - - - - - - - - -  Main - - - - - - - - - #
+  export L_S_SID=${1:?"Missing the source sid"}
+  export L_T_SID=${2:?"Missing the target sid"}
+
+
+
+  PG=$(basename $0)
+  LG=${PG%%.ksh}
+  TS=`date +%Y%m%d`
+
+  export L_COMPLETE=1
+  export L_ERROR=0
+  export L_STEP=${3:-1}
+
+  if FN_ValidENV $L_T_SID ; then
+    FN_Main 2>&1 | tee -a $DBA/logs/${LG}_${L_S_SID}_${L_T_SID}_$(hostname).$TS.log
+  else
+    echo " the $L_T_SID is invalid"
+    export L_ERROR=1
+  fi
+
+  exit $L_ERROR
+# - - - - - - - - - - - - - - - - - - - - - - - - #

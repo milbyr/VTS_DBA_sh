@@ -1,0 +1,98 @@
+#!/usr/bin/ksh
+##########################################################
+typeset myname=vit_l
+#
+# $Header$
+#
+# Velos-IT
+#
+# Purpose : Connects to appropriate host and sets env
+#           0=successfull, 1,2,3=failure-usage
+#
+# Changed by    Date            Comment
+# --------------------------------------------------------
+# ve-milbyr                     Initial Version
+#
+##########################################################
+#
+.   $DBA/bin/vts_utils.ksh
+#
+if [ "${VEND_TRACE:="FALSE"}" = "TRUE" ]
+then
+ set -x
+fi
+#
+if [ $# -lt 2 ]
+then
+  print "Usage: ${myname} <INSTANCE> <db|dw|cp|apps|web> [TIER_Number]"
+  exit 1
+fi
+#
+T_ENV=${1:?"Missing the environment"}
+T_TIER=${2:?"Missing the tier"}
+T_TNUM=${3:-1}
+
+ if FN_ValidENV $T_ENV
+ then
+  FN_Init_Vars $T_ENV
+
+  case $T_TIER in
+    db|DB|dbTier)
+        print "${myname} : Connecting to host ${L_DBSRV} as user ${L_ORAUSER}"
+      ssh  -l $L_ORAUSER $L_DBSRV
+      ;;
+    dw|DW|dwTier)
+        print "${myname} : Connecting to host ${L_DBSRV} as user ${L_OBIUSER}"
+        ssh  -l $L_OBIUSER $L_DBSRV
+       ;;
+    apps|APPS|appsTier)
+      L_CPSRV="`echo ${L_CPSRV} | sed 's/\,/ /g'`"
+      if FN_multiple_var ${L_CPSRV}
+      then
+          if [ -z ${T_TNUM} ]
+            then
+            print "Usage: ${myname} : No Tier_Number specified for a multi-host tier"
+            exit 3
+          fi
+        L_TEMP_HOST=`echo ${L_CPSRV} |cut -f${T_TNUM} -d' '`
+        print "${myname} : Connecting to host ${L_TEMP_HOST} as user ${L_OBIAPPS}"
+        ssh  -l $L_OBIAPPS ${L_TEMP_HOST}
+      else
+        print "${myname} : Connecting to host ${L_IASSRV} as user ${L_OBIAPPS}"
+        ssh  -l $L_OBIAPPS $L_CPSRV
+      fi
+      ;;
+    cp|CP|cpTier)
+        L_TEMP_HOST=`echo ${L_CPSRV} |cut -f${T_TNUM} -d','`
+        print "${myname} : Connecting to host ${L_TEMP_HOST} as user ${L_APPLUSER}"
+        ssh  -l $L_APPLUSER ${L_TEMP_HOST}
+      ;;
+    web|WEB|webTier)
+      if FN_multiple_var ${L_IASSRV}
+      then
+          if [ -z ${T_TNUM} ]
+            then
+            print "Usage: ${myname} : No Tier_Number specified for a multi-host tier"
+            exit 3
+          fi
+        L_TEMP_HOST=`echo ${L_IASSRV} |cut -f${T_TNUM} -d' '`
+        print "${myname} : Connecting to host ${L_TEMP_HOST} as user ${L_APPLUSER}"
+        ssh  -l $L_APPLUSER ${L_TEMP_HOST}
+      else
+        print "${myname} : Connecting to host ${L_IASSRV} as user ${L_APPLUSER}"
+        ssh  -l $L_APPLUSER $L_IASSRV
+      fi
+      ;;
+    root)
+      ssh  -l root  $L_DBSRV
+      #ssh  -l root  $L_IASSRV
+      ;;
+    *)
+      echo "error: $0"
+      FN_ListENVs
+    ;;
+  esac
+ else
+   print "Usage: ${myname} : Environment could not be set : FN_ValidENV indicated not valid"
+   exit 2
+ fi

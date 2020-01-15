@@ -1,0 +1,3 @@
+/export/vtssupp/VTS/bin/vts_ebs_ctrl.ksh D006 STOP ALL
+  # /export/vtssupp/VTS/bin/vts_ebs_ctrl.ksh D006 STOP WEB
+  # /export/vtssupp/VTS/bin/vts_ebs_ctrl.ksh D006 STOP DB

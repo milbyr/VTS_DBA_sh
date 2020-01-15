@@ -1,0 +1,26 @@
+#!/usr/bin/ksh
+## Purpose:  to retrieve the source application host 
+## ssh appld004@`hostname` ". ./.profile ;echo \$APPSPWD;echo \$WLPWD"|grep ^[A-Z]
+
+export DBA=/export/vtssupp/VTS
+
+.  $DBA/bin/vts_utils.ksh
+
+
+
+export L_SRC_SID=${1:?"Missing the source oracle SID"}
+export L_LC_SRC_SID=$(echo $L_SRC_SID | tr "[:upper:]" "[:lower:]" )
+export L_T_HOST=$( FN_GetiASServer $L_SRC_SID )
+
+
+function get_R122_info
+{
+  ssh appl${L_LC_SRC_SID}@${L_T_HOST}  ". ./.profile ;echo \$APPSPWD;echo \$WLPWD" | awk '/^[A-Z]/ {printf " %s", $0}
+  /RUN/ && /fs/  {printf "%s", substr($5,11,3)}'
+
+} ### end of get_R122_info ###
+
+
+get_R122_info
+
+

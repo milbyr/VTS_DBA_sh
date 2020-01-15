@@ -1,0 +1,17 @@
+
+
+# remove L_DST_SID file systems
+# remove L_DST_SID XIV vols
+# duplicate L_SRC_SID XIV vols to L_DST_SID
+# discover L_DST_SID file systems
+# mount L_DST_SID file systems
+# chown dbTier file systems
+# chown appsTier file systems
+
+fn_get_src_pwd.txt | read L_FS L_SRC_APPS_PWD L_SRC_LW_PWD
+
+
+vts_clone_db.ksh <source SID> <target SID> 
+vts_clone_apps.ksh <source SID> <target SID> <source run fs> <source apps pwd> <source wl pwd>
+
+
